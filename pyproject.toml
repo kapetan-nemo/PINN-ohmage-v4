@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pinn_soh"
+version = "0.1.0"
+description = "Физически информированная нейросетевая модель деградации дисковых литий-ионных элементов"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "numpy",
+    "pandas",
+    "polars",
+    "pyarrow",
+    "scipy",
+    "pyyaml",
+    "typer",
+    "requests",
+    "tqdm",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+params = [
+    "pybamm",
+]
+
+[project.scripts]
+pinn-soh-download = "pinn_soh.data.download:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pinn_soh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
