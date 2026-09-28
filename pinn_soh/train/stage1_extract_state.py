@@ -534,14 +534,18 @@ def identify_cell(
             q_pred = theta_of(tn0) * qn_of(qn_r) + theta_of(tp0) * qn_of(qn_r) / rho_of(rho_r)
             q_n_n = q_pred / q_pred[0].clamp_min(1e-9)
             l_cap = torch.mean((q_n_n - q_meas_n) ** 2)
-            # CE-член: инвентарь на цикле m ограничен сверху дефицитом
-            # кулоновской эффективности — канал, независимый от V(t);
-            # лямбда не может «съесть» то, что уже ушло по балансу заряда
-            l_ce = torch.mean(
-                ((q_pred - (q_pred[0] - ce_def)) / q_meas[0].clamp_min(1e-9)) ** 2)
+            # CE-член: кумулятивный дефицит заряда — ВЕРХНЯЯ граница LLI.
+            # Дефицит включает кинетическое усечение разряда и шум
+            # интегрирования, поэтому равенство неверно (на жизни элемента
+            # он превышает сам инвентарь) — штрафуем только превышение
+            # моделью наблюдаемого дефицита; допуск 5% на погрешность.
+            q_li0 = q_pred[0].clamp_min(1e-9)
+            over = torch.clamp(
+                (q_pred[0] - q_pred) - (ce_def + 0.05 * q_li0), min=0.0)
+            l_ce = torch.mean((over / q_li0) ** 2)
         else:
             l_cap = l_ce = torch.zeros((), dtype=torch.float64)
-        return l_volt + 0.5 * l_cap + 0.5 * l_ce, out
+        return l_volt + 0.5 * l_cap + 5.0 * l_ce, out
 
     # --- выбор кода катода ---
     if pseudo_fit:
