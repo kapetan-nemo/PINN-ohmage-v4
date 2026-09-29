@@ -575,9 +575,11 @@ def identify_cell(
             over = torch.clamp(
                 (q_pred[0] - q_pred) - (ce_def + 0.05 * q_li0), min=0.0)
             l_ce = torch.mean((over / q_li0) ** 2)
-            # необратимость: инвентарь не растёт (допуск 0.5% на шум)
-            l_mono = (torch.clamp(
-                q_pred.diff() - 0.005 * q_li0, min=0.0) ** 2).mean()
+            # необратимость: бюджет суммарного роста инвентаря —
+            # потерянный литий не возвращается; допуск 2% на шум
+            l_mono = torch.clamp(
+                torch.clamp(q_pred.diff(), min=0.0).sum()
+                - 0.02 * q_li0, min=0.0) ** 2
         else:
             l_cap = l_ce = l_mono = torch.zeros((), dtype=torch.float64)
         # якорь сопротивления: замер фронтов включает раннюю кинетику,
@@ -588,14 +590,18 @@ def identify_cell(
             viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
                                - torch.log(rt_v[r_meas_ok]), min=0.0)
             l_r = viol.pow(2).mean()
-        # λ нерастущи после формовки: LAM необратим (допуск 0.02/окно
-        # на смачивание и оседание контактов ранних циклов)
+        # λ нерастущи после формовки: LAM необратим. Штраф на
+        # НАКОПЛЕННЫЙ рост сверх бюджета 0.05 за жизнь — точечные
+        # выбросы допустимы (смачивание, шум), тренд вверх — нет:
+        # пооконный допуск 0.02 позволял дрейф ~0.35 на 25 окнах (051)
         if ln is not None:
-            l_mono = l_mono + (torch.clamp(
-                lam_of(ln).diff() - 0.02, min=0.0) ** 2).mean()
+            l_mono = l_mono + torch.clamp(
+                torch.clamp(lam_of(ln).diff(), min=0.0).sum() - 0.05,
+                min=0.0) ** 2
         if lp is not None:
-            l_mono = l_mono + (torch.clamp(
-                lam_of(lp).diff() - 0.02, min=0.0) ** 2).mean()
+            l_mono = l_mono + torch.clamp(
+                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
+                min=0.0) ** 2
         return l_volt + 0.5 * l_cap + 5.0 * l_ce + 3.0 * l_r \
             + 2.0 * l_mono, out
 
@@ -839,9 +845,14 @@ def refine_per_cycle(
             viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
                                - torch.log(rt_v[r_meas_ok]), min=0.0)
             l_r = viol.pow(2).mean()
-        # λ нерастущи после формовки (допуск 0.02/окно)
-        l_mono = (torch.clamp(lam_of(ln).diff() - 0.02, min=0.0) ** 2).mean() \
-            + (torch.clamp(lam_of(lp).diff() - 0.02, min=0.0) ** 2).mean()
+        # λ нерастущи после формовки: бюджет суммарного роста 0.05
+        # за жизнь (как в identify — тренд вверх запрещён, выбросы нет)
+        l_mono = torch.clamp(
+            torch.clamp(lam_of(ln).diff(), min=0.0).sum() - 0.05,
+            min=0.0) ** 2 \
+            + torch.clamp(
+                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
+                min=0.0) ** 2
         loss = l_volt + 0.5 * l_cap + w_cont * l_cont + 3.0 * l_r \
             + 2.0 * l_mono
         loss.backward()
