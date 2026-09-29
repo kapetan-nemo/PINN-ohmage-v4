@@ -47,12 +47,14 @@ PROC = ROOT / "data" / "processed"
 OUT = ROOT / "reports" / "forecast"
 
 
-def measured_soh(cycles: pl.DataFrame, first_main: int):
+def measured_soh(cycles: pl.DataFrame, first_main: int,
+                 artefact: set[int] | None = None):
     """Измеренная SOH: разрядная ёмкость / ёмкость первого основного цикла.
 
-    Циклы с длительностью < 70% медианы отбрасываются: это оборванные
-    записи (остановка циклёра посреди разряда), а не реальная
-    деградация — у 38% элементов последний цикл усечён.
+    Отбрасываются: циклы с длительностью < 70% медианы (оборванные записи,
+    у 38% элементов последний цикл усечён) и артефактные циклы из отчёта
+    качества (выбросы напряжения/SOH) — иначе точка пришивки и метрики
+    загрязняются артефактами.
     """
     cc = cycles.sort("cycle")
     ids = cc["cycle"].to_numpy()
@@ -63,6 +65,8 @@ def measured_soh(cycles: pl.DataFrame, first_main: int):
     ids, q, dur = ids[m], q[m], dur[m]
     med_dur = np.median(dur[5:]) if len(dur) > 10 else np.median(dur)
     ok = dur >= 0.7 * med_dur
+    if artefact:
+        ok = ok & ~np.isin(ids, list(artefact))
     if ok.any():
         ids, q = ids[ok], q[ok]
     q0 = q[0]
@@ -274,7 +278,8 @@ def main() -> None:
         pseudo = build_pseudo_ocv(df, rep.formation_cycles)
         last_cycle = int(pdf["cycle"].max())
         first_main = rep.formation_cycles + 1
-        cy_t, soh_t, q_ref = measured_soh(cycles, first_main)
+        cy_t, soh_t, q_ref = measured_soh(
+            cycles, first_main, set(rep.artefact_cycles))
         print(f"\n=== {cid}: циклов до {last_cycle}, отсечка {v_max} В "
               f"(SOH_кон {soh_t[-1]:.3f}) ===", flush=True)
 
@@ -303,7 +308,8 @@ def main() -> None:
                         ac_ = torch.tensor(a["code"])
                 feats_ = build_features(md, ac_)
                 z0_ = z_pop if enc is None else enc(feats_)
-                z_ = fit_z_prefix(r, pdf, consts, iters=150, z0=z0_)
+                z_ = fit_z_prefix(r, pdf, consts, iters=150, z0=z0_,
+                                  area_m2=area_m2)
                 if trans is None:
                     feats_ = None
                 f = forecast(r, pdf, ocv_n, ocv_p, consts, z_,

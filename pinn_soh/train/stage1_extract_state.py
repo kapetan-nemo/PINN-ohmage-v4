@@ -33,10 +33,12 @@ import polars as pl
 import torch
 
 from pinn_soh.physics.cell import F_CONST, R_CONST, T_REF
-from pinn_soh.physics.degradation import resolve_stoich_windows
 from pinn_soh.physics.ocv import MonotoneOCV, torchinterp1
 
 N_POINTS = 300          # точек на цикл после прореживания/дополнения
+# пороги фронтов при прореживании пачки (как в preprocess.downsample_cycle)
+I_STEP_A = 2e-4
+V_JUMP_V = 0.02
 TAU_D_DEFAULT = (60.0, 600.0)
 R_D_DEFAULT = (0.005, 0.005)
 
@@ -152,8 +154,13 @@ def simulate_batch(
             + (-theta_p).clamp_min(0.0) ** 2
         v_hat = v_hat + edge_v * (over_chg - over_dch)
     if hyst_v is not None:
-        # смещение ветви: заряд — вверх, разряд — вниз; гладко через I=0
-        v_hat = v_hat + hyst_v.unsqueeze(1) * torch.tanh(i / 2e-4)
+        # смещение ветви: заряд — вверх, разряд — вниз; гладко через I=0.
+        # Ширина перехода — доля медианного активного тока пачки (было
+        # зашито 2e-4 А — неверно для форм-факторов с другими токами)
+        i_act = i[(i.abs() > 1e-6)]
+        w_h = (0.15 * i_act.abs().median()).clamp_min(1e-9) \
+            if i_act.numel() else torch.tensor(2e-4, dtype=torch.float64)
+        v_hat = v_hat + hyst_v.unsqueeze(1) * torch.tanh(i / w_h)
     phi_n = u_n - eta_n
     return {"v_hat": v_hat, "phi_n": phi_n, "theta_n": theta_n,
             "theta_p": theta_p, "eta_p": eta_p, "eta_n": eta_n,
@@ -169,8 +176,20 @@ def pack_cycles(df: pl.DataFrame, cycle_ids: list[int], n_points: int = N_POINTS
         tt = sub["t_s"].to_numpy()
         ii = sub["i_a"].to_numpy()
         vv = sub["v_v"].to_numpy()
-        if n > n_points:  # безопасное прореживание до n_points
-            idx = np.linspace(0, n - 1, n_points).round().astype(int)
+        if n > n_points:  # прореживание до n_points с сохранением фронтов:
+            # равномерная подсетка + точки скачков тока/напряжения (иначе
+            # фронты, сохранённые preprocess, теряются — это точки с
+            # информацией об R и η)
+            di = np.abs(np.diff(ii, prepend=ii[0]))
+            dv = np.abs(np.diff(vv, prepend=vv[0]))
+            fronts = np.nonzero((di > I_STEP_A) | (dv > V_JUMP_V))[0]
+            idx = np.unique(np.concatenate(
+                [np.linspace(0, n - 1, n_points).round().astype(int),
+                 fronts, fronts - 1, fronts + 1]))
+            idx = idx[(idx >= 0) & (idx < n)]
+            if len(idx) > n_points:      # фронтов больше квоты — равномерно
+                idx = idx[np.linspace(0, len(idx) - 1,
+                                      n_points).round().astype(int)]
             tt, ii, vv = tt[idx], ii[idx], vv[idx]
             n = n_points
         pad = n_points - n
@@ -241,6 +260,7 @@ class IdentifiedCell:
     ocv_n_scale: float = 1.0                       # аффинная коррекция кривой анода
     ocv_n_shift_v: float = 0.0
     anchor_name: str = ""
+    area_m2: float = 1.54e-4                       # площадь электрода элемента
     ocv_p_delta: list = field(default_factory=list)  # поправки кривых, В
     ocv_n_delta: list = field(default_factory=list)
     v_hat: object = None                           # (B,N) тензор предсказанного V
@@ -337,6 +357,9 @@ def _fit_pseudo_ocv(
             + 2e-3 * (dp ** 2).mean() + 2e-3 * (dn ** 2).mean() \
             + 5e-2 * (dp.diff(2) ** 2).mean() + 5e-2 * (dn.diff(2) ** 2).mean()
         if not torch.isfinite(loss):            # защита от расходимости
+            import warnings
+            warnings.warn("псевдо-OCV подгонка расходится — дефолтные "
+                          "окна/ёмкости; проверить качество pseudo-ocv")
             return {"rmse_mv": float("inf"), "anchor": "", "theta_n0": 0.15,
                     "theta_p0": 0.9, "q_n_ah": q0_ah / 0.75, "rho": 1.1,
                     "c_p": cp0.detach(), "sp": sp0, "bp": bp0,
@@ -395,6 +418,7 @@ def identify_cell(
     """
     t_start = time.time()
     res = IdentifiedCell(cell_id=cell_id)
+    res.area_m2 = area_m2
     main_ids = cycles.filter(pl.col("cycle") > formation_cycles)["cycle"].to_list()
     if max_cycle is not None:                     # префикс-режим прогноза
         main_ids = [c for c in main_ids if c <= max_cycle]
@@ -415,6 +439,12 @@ def identify_cell(
 
     def r_of(raw: torch.Tensor) -> torch.Tensor:
         return r_floor + torch.nn.functional.softplus(raw)
+
+    # бюджет суммарного роста λ масштабируется на горизонт в циклах:
+    # физический рост LAM за жизнь элемента ~0.05 при ~800 циклах —
+    # на префиксе K=100 бюджет 0.006, на полной жизни ~0.05
+    span_cyc = max(sub_ids[-1] - sub_ids[0], 1) if len(sub_ids) > 1 else 1
+    lam_budget = max(0.01, 0.05 * span_cyc / 800.0)
 
     def inv_softplus(y: float) -> float:
         return math.log(math.expm1(y))
@@ -580,7 +610,14 @@ def identify_cell(
         )
         l_volt = _huber(out["v_hat"], v, mask)
         if with_cap:
-            q_pred = theta_of(tn0) * qn_of(qn_r) + theta_of(tp0) * qn_of(qn_r) / rho_of(rho_r)
+            # инвентарь циклируемого лития — всегда С λ (LAM масштабирует
+            # ёмкость электрода): единая дефиниция с refine и с тем, что
+            # сохраняется в чекпоинт. Без λ канал оставался ограниченным
+            # только напряжением — недоопределённое направление λ↔θ.
+            lam_n_v = lam_of(ln) if ln is not None else 1.0
+            lam_p_v = lam_of(lp) if lp is not None else 1.0
+            q_pred = theta_of(tn0) * qn_of(qn_r) * lam_n_v \
+                + theta_of(tp0) * qn_of(qn_r) / rho_of(rho_r) * lam_p_v
             q_n_n = q_pred / q_pred[0].clamp_min(1e-9)
             l_cap = torch.mean((q_n_n - q_meas_n) ** 2)
             # CE-член: кумулятивный дефицит заряда — ВЕРХНЯЯ граница LLI.
@@ -600,16 +637,16 @@ def identify_cell(
         else:
             l_cap = l_ce = l_mono = torch.zeros((), dtype=torch.float64)
         # λ нерастущи после формовки: LAM необратим. Штраф на
-        # НАКОПЛЕННЫЙ рост сверх бюджета 0.05 за жизнь — точечные
-        # выбросы допустимы (смачивание, шум), тренд вверх — нет:
-        # пооконный допуск 0.02 позволял дрейф ~0.35 на 25 окнах (051)
+        # НАКОПЛЕННЫЙ рост сверх бюджета, масштабированного на горизонт
+        # (lam_budget ~0.05/800 циклов) — точечные выбросы допустимы
+        # (смачивание, шум), тренд вверх — нет
         if ln is not None:
             l_mono = l_mono + torch.clamp(
-                torch.clamp(lam_of(ln).diff(), min=0.0).sum() - 0.05,
+                torch.clamp(lam_of(ln).diff(), min=0.0).sum() - lam_budget,
                 min=0.0) ** 2
         if lp is not None:
             l_mono = l_mono + torch.clamp(
-                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
+                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - lam_budget,
                 min=0.0) ** 2
         return l_volt + 0.5 * l_cap + 5.0 * l_ce + 2.0 * l_mono, out
 
@@ -714,7 +751,9 @@ def identify_cell(
         q_n_v = float(qn_of(q_n_raw.detach()))
         rho_v = float(rho_of(rho_raw.detach()))
         q_p_v = q_n_v / rho_v
-        q_li = tn * q_n_v + tp * q_p_v   # А·ч-эквивалент запаса лития
+        # инвентарь с λ — та же дефиниция, что в loss_fn и refine
+        q_li = tn * q_n_v * lam_of(lam_n_raw).detach() \
+            + tp * q_p_v * lam_of(lam_p_raw).detach()
         res.c_n = [float(x) for x in c_n.tolist()]
         res.c_p = [float(x) for x in c_p.detach().tolist()]
         res.rho = rho_v
@@ -778,6 +817,10 @@ def refine_per_cycle(
 
     def r_of(raw: torch.Tensor) -> torch.Tensor:
         return r_floor + torch.nn.functional.softplus(raw)
+
+    span_cyc = max(res.cycles[-1] - res.cycles[0], 1) \
+        if len(res.cycles) > 1 else 1
+    lam_budget = max(0.01, 0.05 * span_cyc / 800.0)
 
     def theta_of(raw):
         return -0.2 + 1.4 * raw.sigmoid()
@@ -850,13 +893,13 @@ def refine_per_cycle(
         # непрерывность траекторий в логит-/лог-координатах
         l_cont = sum(((p[1:] - p[:-1]) ** 2).mean()
                      for p in (tn0, tp0, rt, ln, lp))
-        # λ нерастущи после формовки: бюджет суммарного роста 0.05
-        # за жизнь (как в identify — тренд вверх запрещён, выбросы нет)
+        # λ нерастущи после формовки: бюджет суммарного роста,
+        # масштабированный на горизонт (как в identify)
         l_mono = torch.clamp(
-            torch.clamp(lam_of(ln).diff(), min=0.0).sum() - 0.05,
+            torch.clamp(lam_of(ln).diff(), min=0.0).sum() - lam_budget,
             min=0.0) ** 2 \
             + torch.clamp(
-                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
+                torch.clamp(lam_of(lp).diff(), min=0.0).sum() - lam_budget,
                 min=0.0) ** 2
         loss = l_volt + 0.5 * l_cap + w_cont * l_cont + 2.0 * l_mono
         loss.backward()

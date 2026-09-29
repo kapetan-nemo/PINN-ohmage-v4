@@ -76,9 +76,13 @@ def resolve_windows_full(
     элемента ``V(θ_n)`` монотонно по θ_n — отсечки решаются бисекцией.
     """
     q_n, q_p = q_n_ah * lam_n, q_n_ah / rho * lam_p
-    th = torch.linspace(1e-4, 1.0, n_grid, dtype=torch.float64)
+    # сетка в том же допустимом диапазоне, что у идентификации
+    # (theta_of: (−0.2, 1.2)) — иначе элементы с идентифицированным
+    # θ>1 молча перепроецируются в [0,1] на стыке (дисконтинуитет
+    # состояния); за [0,1] работает линейная экстраполяция _u_eval
+    th = torch.linspace(-0.15, 1.15, n_grid, dtype=torch.float64)
     theta_p = (q_li_ah - th * q_n) / q_p
-    valid = (theta_p > 1e-4) & (theta_p < 1.0)
+    valid = (theta_p > -0.15) & (theta_p < 1.15)
     if valid.sum() < 2:
         return {"theta_n0": None, "degenerate": True}
     th_v, tp_v = th[valid], theta_p[valid]
@@ -128,6 +132,7 @@ def fit_z_prefix(
     iters: int = 200,
     lr: float = 0.05,
     z0: torch.Tensor | None = None,
+    area_m2: float | None = None,
 ) -> torch.Tensor:
     """Калибровка кинетики z по траектории q_li префикса (grey-box).
 
@@ -155,7 +160,9 @@ def fit_z_prefix(
     r_true = torch.tensor(cell.r_total, dtype=torch.float64)
     for _ in range(iters):
         opt.zero_grad()
-        pred = rollout_state(cell, z, consts)
+        pred = rollout_state(
+            cell, z, consts,
+            area_m2=getattr(res, "area_m2", None) or area_m2 or 1.54e-4)
         # на коротком префиксе траектория R — ключевое ограничение
         # на ρ_SEI/k_SEI (растёт сильнее, чем падает q_li)
         # априор к z0 (encoder): короткий префикс плохо ограничивает
@@ -214,10 +221,22 @@ def forecast(
     (ветка ансамбля «LAM не персистентен»); ``lam_snr=False`` отключает
     SNR-взвешивание λ-каналов (ветка «LAM персистентен»).
     """
-    # шаблон цикла: последний идентифицированный
+    # шаблон цикла: последний идентифицированный с ТИПИЧНОЙ
+    # длительностью — последний цикл префикса может быть усечённым/
+    # атипичным, тогда шаблон искажает весь прогнозный профиль
     if i_template is None:
         import polars as pl
-        sub = df.filter(pl.col("cycle") == res.cycles[-1]).sort("t_s")
+        cand = res.cycles[-5:]
+        durs = []
+        for c_ in cand:
+            sub_ = df.filter(pl.col("cycle") == c_)
+            durs.append(float(sub_["t_s"].max() - sub_["t_s"].min())
+                        if sub_.height else 0.0)
+        med_dur = np.median(durs) if durs else 0.0
+        cyc_t = next(
+            (c_ for c_, d_ in zip(reversed(cand), reversed(durs))
+             if d_ >= 0.7 * med_dur), res.cycles[-1])
+        sub = df.filter(pl.col("cycle") == cyc_t).sort("t_s")
         tt = sub["t_s"].to_numpy()
         i_template = (tt - tt[0], sub["i_a"].to_numpy())
     tt_rel, ii = i_template
@@ -262,19 +281,24 @@ def forecast(
     lam_n0 = float(np.mean((res.lam_n or [1.0])[-3:]))
     lam_p0 = float(np.mean((res.lam_p or [1.0])[-3:]))
 
-    def lam_slope(lam: list[float]) -> float:
+    def lam_slope(lam: list[float], rate_floor: float) -> float:
         """Линейный тренд относительной ёмкости по последним циклам
-        (дрейф LAM), в единицах на цикл; экстраполяция ограничена."""
+        (дрейф LAM), в единицах на цикл; экстраполяция ограничена.
+        Наклон слабее шума идентификации (|Δλ|/цикл по популяции)
+        трактуется как нулевой — иначе шумовой тренд префикса
+        экстраполируется в ложный спад."""
         if len(lam) < 4:
             return 0.0
         m = min(12, len(lam))
         x = np.asarray(res.cycles[-m:], float)
         y = np.asarray(lam[-m:], float)
+        s = float(np.polyfit(x - x[0], y, 1)[0])
         # ёмкость электрода физически не растёт: наклон неположителен
-        return min(float(np.polyfit(x - x[0], y, 1)[0]), 0.0)
+        return min(s, 0.0) if abs(s) > rate_floor else 0.0
 
-    dlam_n = lam_slope(res.lam_n or [1.0])
-    dlam_p = lam_slope(res.lam_p or [1.0])
+    # пороги — медианный шум идентификации λ на цикл (по популяции)
+    dlam_n = lam_slope(res.lam_n or [1.0], 1.5e-3)
+    dlam_p = lam_slope(res.lam_p or [1.0], 6.7e-4)
     qli0_, r0_ = res.q_li_ah[0], res.r_total_ohm[0]
     lam_n, lam_p = lam_n0, lam_p0
     r_state = res.r_total_ohm[-1]
@@ -287,7 +311,8 @@ def forecast(
         dq_prev = 0.0
 
     def lam_at(lam0: float, dlam: float, k: int) -> float:
-        return float(np.clip(lam0 + dlam * (k - cyc0), 0.3, 1.6))
+        # границы те же, что у lam_of в идентификации: (0.4, 1.6)
+        return float(np.clip(lam0 + dlam * (k - cyc0), 0.4, 1.6))
 
     # кинетические константы с множителями z
     def _prefix_gains(lam_snr: bool = True):
@@ -649,8 +674,8 @@ def forecast(
         # приращения переводят состояние kk → kk+stride: записанные
         # массивы описывают состояние на своей метке цикла
         dq_prev = dq_next
-        lam_n = float(np.clip(lam_n - dlamn_inc, 0.3, 1.6))
-        lam_p = float(np.clip(lam_p - dlamp_inc, 0.3, 1.6))
+        lam_n = float(np.clip(lam_n - dlamn_inc, 0.4, 1.6))
+        lam_p = float(np.clip(lam_p - dlamp_inc, 0.4, 1.6))
         # физический потолок: максимум по популяции ~1 кОм
         # (плёнка SEI + контакты); без ограничения ΔlogR-канал
         # экстраполируется экспоненциально и убивает разряд
@@ -730,8 +755,9 @@ def forecast_ensemble(
     """Ансамбль прогнозов: z + шум σ (в декадах) → квантили SOH.
 
     Возвращает ``{"cycles", "soh_p10", "soh_p50", "soh_p90", "members"}``.
-    Шум по лог-множителям покрывает неопределённость кинетики,
-    дополнительный лёгкий шум наклона λ — неопределённость LAM.
+    Шум по лог-множителям покрывает только неопределённость кинетики z;
+    неопределённость идентификации задаётся другими осями ансамбля
+    (ident-ensemble, r_fate).
     """
     rng = np.random.default_rng(seed)
     members, cycs = [], []

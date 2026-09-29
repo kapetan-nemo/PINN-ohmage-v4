@@ -52,6 +52,9 @@ def main() -> None:
     ap.add_argument("--iters-b", type=int, default=700)
     ap.add_argument("--refine", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--restarts", type=int, default=1,
+                    help="мультистарт: прогоны identify с seed 0..N-1, "
+                         "оставляется лучший по V RMSE")
     args = ap.parse_args()
 
     quality = json.loads((ROOT / "configs" / "cell_quality.json").read_text())
@@ -92,20 +95,32 @@ def main() -> None:
                 pdf = proc.df
             area_m2 = (meta.electrode_areas.get("positive_cm2") or 1.539) * 1e-4
             pseudo = build_pseudo_ocv(df, rep.formation_cycles)
-            res = identify_cell(
-                cid, pdf, cycles, ocv_n, ocv_p, anchors,
-                formation_cycles=rep.formation_cycles,
-                area_m2=area_m2, stride=args.stride,
-                iters_a=args.iters_a, iters_b=args.iters_b,
-                v_min=rep.protocol_summary.get("v_min_main") or 2.5,
-                v_max=rep.protocol_summary.get("v_max_main") or 4.2,
-                pseudo=pseudo, verbose=False,
-            )
+            res = None
+            for s_ in range(args.restarts):
+                res_s = identify_cell(
+                    cid, pdf, cycles, ocv_n, ocv_p, anchors,
+                    formation_cycles=rep.formation_cycles,
+                    area_m2=area_m2, stride=args.stride,
+                    iters_a=args.iters_a, iters_b=args.iters_b,
+                    v_min=rep.protocol_summary.get("v_min_main") or 2.5,
+                    v_max=rep.protocol_summary.get("v_max_main") or 4.2,
+                    pseudo=pseudo, verbose=False, seed=s_)
+                if res is None or res_s.v_rmse_mv < res.v_rmse_mv:
+                    res = res_s
             if args.refine:
                 res = refine_per_cycle(res, pdf, cycles, ocv_n, ocv_p,
                                        area_m2=area_m2, iters=args.refine)
+            import subprocess
+            try:
+                code_version = subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                    text=True).strip()
+            except Exception:
+                code_version = "unknown"
             out = {
                 "cell_id": res.cell_id, "anchor": res.anchor_name,
+                "code_version": code_version,
+                "restarts": args.restarts,
                 "rho": res.rho, "q_n_ah": res.q_n_ah,
                 "c_n": res.c_n, "c_p": res.c_p, "j0_mult": list(res.j0_mult),
                 "ocv_p_scale": res.ocv_p_scale, "ocv_p_shift_v": res.ocv_p_shift_v,

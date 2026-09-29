@@ -108,7 +108,8 @@ def trapz_weights(t: torch.Tensor) -> torch.Tensor:
 def rollout_state(cell: CellData, z: torch.Tensor,
                   consts: DegradationConsts,
                   resid: torch.nn.Module | None = None,
-                  temp_k: float = T_REF) -> dict:
+                  temp_k: float = T_REF,
+                  area_m2: float = 1.54e-4) -> dict:
     """Рекурсивный прогон медленного состояния по идентифицированным циклам.
 
     ``z`` — вектор множителей (Z_DIM); возвращает предсказанные
@@ -154,7 +155,7 @@ def rollout_state(cell: CellData, z: torch.Tensor,
         q_new = (q_li_pred[-1] - gap * dq_lli).clamp(min=1e-6)
         q_li_pred.append(q_new)
         deltas.append(delta)
-        r_pred.append(r0 + delta * rho_sei / 1.54e-4)
+        r_pred.append(r0 + delta * rho_sei / area_m2)
     return {
         "q_li": torch.stack(q_li_pred),
         "r_total": torch.stack([torch.as_tensor(v, dtype=torch.float64) for v in r_pred]),
