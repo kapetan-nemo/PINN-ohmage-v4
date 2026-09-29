@@ -386,6 +386,7 @@ def identify_cell(
     pseudo: pl.DataFrame | None = None,
     pseudo_steps: int = 700,
     max_cycle: int | None = None,
+    seed: int = 0,
 ) -> IdentifiedCell:
     """Идентификация параметров одного элемента по его циклам.
 
@@ -403,6 +404,17 @@ def identify_cell(
     sub_ids = [c for c in main_ids[::stride_eff] if c in avail]
     t, i, v, mask = pack_cycles(df, sub_ids)
     B, N = i.shape
+
+    # жёсткий пол сопротивления: r = floor + softplus(raw) — замеренный
+    # IR-скачок включает раннюю кинетику, floor = 0.3×замера; без замера
+    # floor = 0 (свободно). Жёсткая параметризация вместо штрафа:
+    # занижение r_total ниже измеримого уровня исключено конструкцией
+    r_meas_np = cycle_r_meas(df, sub_ids)
+    r_floor = torch.tensor(
+        0.3 * np.nan_to_num(r_meas_np, nan=0.0), dtype=torch.float64)
+
+    def r_of(raw: torch.Tensor) -> torch.Tensor:
+        return r_floor + torch.nn.functional.softplus(raw)
 
     def inv_softplus(y: float) -> float:
         return math.log(math.expm1(y))
@@ -471,15 +483,27 @@ def identify_cell(
         return math.log(z / (1 - z))
 
     # --- поцикловые параметры (в логит-/лог-координатах) ---
-    tn0_init = pseudo_fit["theta_n0"] if pseudo_fit else 0.15
-    tp0_init = pseudo_fit["theta_p0"] if pseudo_fit else 0.75
+    # seed>0 — мультистарт-джиттер инициализаций для диагностики
+    # ширины оврага минимумов (идентификационная неопределённость)
+    rng = np.random.default_rng(seed) if seed else None
+    jit = (lambda s: float(rng.normal(0.0, s)) if rng else 0.0)
+    tn0_init = (pseudo_fit["theta_n0"] if pseudo_fit else 0.15) + jit(0.05)
+    tp0_init = (pseudo_fit["theta_p0"] if pseudo_fit else 0.75) + jit(0.05)
     theta_n0 = torch.full((B,), theta_raw(tn0_init), dtype=torch.float64).requires_grad_()
     theta_p0 = torch.full((B,), theta_raw(tp0_init), dtype=torch.float64).requires_grad_()
-    r_total = torch.full((B,), math.log(0.03), dtype=torch.float64).requires_grad_()
+    # r = floor + softplus(raw): инициализация floor+10 Ом, по сиду
+    # множитель lognormal(0,0.5) на стартовый запас над полом
+    r_head0 = 10.0 * (float(rng.lognormal(0.0, 0.5)) if rng else 1.0)
+    r_total = torch.log(torch.expm1(
+        torch.full((B,), r_head0, dtype=torch.float64))).requires_grad_()
     # полуразмах гистерезиса ветви заряд/разряд: 80 мВ·tanh (поцикловый)
     hyst_raw = torch.zeros(B, dtype=torch.float64).requires_grad_()
-    lam_n_raw = torch.zeros(B, dtype=torch.float64).requires_grad_()
-    lam_p_raw = torch.zeros(B, dtype=torch.float64).requires_grad_()
+    lam_n_raw = torch.tensor(
+        rng.normal(0.0, 0.03, B) if rng else np.zeros(B),
+        dtype=torch.float64).requires_grad_()
+    lam_p_raw = torch.tensor(
+        rng.normal(0.0, 0.03, B) if rng else np.zeros(B),
+        dtype=torch.float64).requires_grad_()
     if pseudo_fit:
         with torch.no_grad():
             q_n_raw.fill_(inv_softplus(pseudo_fit["q_n_ah"]))
@@ -521,13 +545,6 @@ def identify_cell(
          for cid in sub_ids],
         dtype=torch.float64)
 
-    # измеренное сопротивление цикла: медиана |ΔV/ΔI| на фронтах тока —
-    # прямой канал наблюдения r_total, независимый от формы кривой V(t)
-    r_meas_np = cycle_r_meas(df, sub_ids)
-    r_meas_t = torch.tensor(np.nan_to_num(r_meas_np, nan=0.0),
-                            dtype=torch.float64)
-    r_meas_ok = torch.tensor(np.isfinite(r_meas_np))
-
     # аффинные пары кривых: инициализация из якорей/фазы 0
     sp0_init = pseudo_fit["sp"] if pseudo_fit else 1.0
     bp0_init = pseudo_fit["bp"] if pseudo_fit else 0.0
@@ -553,7 +570,7 @@ def identify_cell(
         out = simulate_batch(
             t, i, mask, ocv_n, ocv_p,
             theta_of(tn0), theta_of(tp0), qn_of(qn_r), rho_of(rho_r),
-            rt.exp(), torch.exp(lj0n), torch.exp(lj0p), area_m2, c_n, cp_local,
+            r_of(rt), torch.exp(lj0n), torch.exp(lj0p), area_m2, c_n, cp_local,
             lam_n=lam_of(ln) if ln is not None else None,
             lam_p=lam_of(lp) if lp is not None else None,
             ocv_p_affine=(torch.exp(sp_raw), bp),
@@ -582,14 +599,6 @@ def identify_cell(
                 - 0.02 * q_li0, min=0.0) ** 2
         else:
             l_cap = l_ce = l_mono = torch.zeros((), dtype=torch.float64)
-        # якорь сопротивления: замер фронтов включает раннюю кинетику,
-        # поэтому пол — 0.3×замера; штраф только за сильное занижение
-        l_r = torch.zeros((), dtype=torch.float64)
-        if bool(r_meas_ok.any()):
-            rt_v = rt.exp()
-            viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
-                               - torch.log(rt_v[r_meas_ok]), min=0.0)
-            l_r = viol.pow(2).mean()
         # λ нерастущи после формовки: LAM необратим. Штраф на
         # НАКОПЛЕННЫЙ рост сверх бюджета 0.05 за жизнь — точечные
         # выбросы допустимы (смачивание, шум), тренд вверх — нет:
@@ -602,8 +611,7 @@ def identify_cell(
             l_mono = l_mono + torch.clamp(
                 torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
                 min=0.0) ** 2
-        return l_volt + 0.5 * l_cap + 5.0 * l_ce + 3.0 * l_r \
-            + 2.0 * l_mono, out
+        return l_volt + 0.5 * l_cap + 5.0 * l_ce + 2.0 * l_mono, out
 
     # --- выбор кода катода ---
     if pseudo_fit:
@@ -702,7 +710,7 @@ def identify_cell(
     with torch.no_grad():
         tn = theta_of(theta_n0).detach()
         tp = theta_of(theta_p0).detach()
-        rt = r_total.exp().detach()
+        rt = r_of(r_total.detach())
         q_n_v = float(qn_of(q_n_raw.detach()))
         rho_v = float(rho_of(rho_raw.detach()))
         q_p_v = q_n_v / rho_v
@@ -765,9 +773,11 @@ def refine_per_cycle(
     t, i, v, mask = pack_cycles(df, res.cycles)
     B, N = i.shape
     r_meas_np = cycle_r_meas(df, res.cycles)
-    r_meas_t = torch.tensor(np.nan_to_num(r_meas_np, nan=0.0),
-                            dtype=torch.float64)
-    r_meas_ok = torch.tensor(np.isfinite(r_meas_np))
+    r_floor = torch.tensor(
+        0.3 * np.nan_to_num(r_meas_np, nan=0.0), dtype=torch.float64)
+
+    def r_of(raw: torch.Tensor) -> torch.Tensor:
+        return r_floor + torch.nn.functional.softplus(raw)
 
     def theta_of(raw):
         return -0.2 + 1.4 * raw.sigmoid()
@@ -788,7 +798,9 @@ def refine_per_cycle(
 
     tn0 = tr(res.theta_n0, theta_raw).requires_grad_()
     tp0 = tr(res.theta_p0, theta_raw).requires_grad_()
-    rt = torch.log(torch.tensor(res.r_total_ohm, dtype=torch.float64)).requires_grad_()
+    rt = torch.log(torch.expm1(
+        torch.clamp(torch.tensor(res.r_total_ohm, dtype=torch.float64)
+                    - r_floor, min=1e-3))).requires_grad_()
     lj0n = torch.full((B,), math.log(max(res.j0_mult[0], 1e-6)),
                       dtype=torch.float64).requires_grad_()
     lj0p = torch.full((B,), math.log(max(res.j0_mult[1], 1e-6)),
@@ -824,7 +836,7 @@ def refine_per_cycle(
         opt.zero_grad()
         out = simulate_batch(
             t, i, mask, ocv_n, ocv_p,
-            theta_of(tn0), theta_of(tp0), q_n, rho, rt.exp(),
+            theta_of(tn0), theta_of(tp0), q_n, rho, r_of(rt),
             lj0n.exp().unsqueeze(1), lj0p.exp().unsqueeze(1),
             area_m2, c_n, c_p,
             lam_n=lam_of(ln), lam_p=lam_of(lp),
@@ -838,13 +850,6 @@ def refine_per_cycle(
         # непрерывность траекторий в логит-/лог-координатах
         l_cont = sum(((p[1:] - p[:-1]) ** 2).mean()
                      for p in (tn0, tp0, rt, ln, lp))
-        # якорь R по замеренным фронтам тока (как в identify)
-        l_r = torch.zeros((), dtype=torch.float64)
-        if bool(r_meas_ok.any()):
-            rt_v = rt.exp()
-            viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
-                               - torch.log(rt_v[r_meas_ok]), min=0.0)
-            l_r = viol.pow(2).mean()
         # λ нерастущи после формовки: бюджет суммарного роста 0.05
         # за жизнь (как в identify — тренд вверх запрещён, выбросы нет)
         l_mono = torch.clamp(
@@ -853,8 +858,7 @@ def refine_per_cycle(
             + torch.clamp(
                 torch.clamp(lam_of(lp).diff(), min=0.0).sum() - 0.05,
                 min=0.0) ** 2
-        loss = l_volt + 0.5 * l_cap + w_cont * l_cont + 3.0 * l_r \
-            + 2.0 * l_mono
+        loss = l_volt + 0.5 * l_cap + w_cont * l_cont + 2.0 * l_mono
         loss.backward()
         opt.step()
         sched.step()
@@ -867,7 +871,7 @@ def refine_per_cycle(
         lam_n_v, lam_p_v = lam_of(ln), lam_of(lp)
         res.theta_n0 = [float(x) for x in tn_v]
         res.theta_p0 = [float(x) for x in tp_v]
-        res.r_total_ohm = [float(x) for x in rt.exp()]
+        res.r_total_ohm = [float(x) for x in r_of(rt)]
         res.lam_n = [float(x) for x in lam_n_v]
         res.lam_p = [float(x) for x in lam_p_v]
         res.hyst_mv = [float(0.08 * torch.tanh(x) * 1000) for x in hy]
