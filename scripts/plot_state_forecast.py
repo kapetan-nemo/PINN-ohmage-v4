@@ -49,6 +49,8 @@ def measured_q_dchg(cid: str):
             cs = detect_current_sign(df)
             cyc = per_cycle_stats(df, cs).sort("cycle")
             cyc = cyc.filter(pl.col("q_dchg_ah") > 0)  # выдержка cy0, обрезки
+            med = float(cyc["q_dchg_ah"].median() or 0.0)
+            cyc = cyc.filter(pl.col("q_dchg_ah") < 3.0 * med)  # артефакт cy0
             return cyc["cycle"].to_numpy(), cyc["q_dchg_ah"].to_numpy()
     return None, None
 

@@ -189,6 +189,31 @@ def pack_cycles(df: pl.DataFrame, cycle_ids: list[int], n_points: int = N_POINTS
     return t, i, v, mask.bool()
 
 
+def cycle_r_meas(df: pl.DataFrame, cycle_ids: list[int]) -> np.ndarray:
+    """Медиана |ΔV/ΔI| на фронтах тока цикла — прямое измерение
+    быстрого сопротивления из данных. На 10-с сетке замер включает
+    раннюю кинетику, поэтому служит верхней границей чистой омики и
+    нижней границей идентифицируемого r_total. NaN, если скачков нет.
+    """
+    out = np.full(len(cycle_ids), np.nan)
+    for k, cid in enumerate(cycle_ids):
+        sub = df.filter(pl.col("cycle") == cid).sort("t_s")
+        vv = sub["v_v"].to_numpy()
+        ii = sub["i_a"].to_numpy()
+        if len(ii) < 2:
+            continue
+        di = np.abs(np.diff(ii))
+        thr = 0.3 * max(float(np.abs(ii).max()), 1e-6)
+        j = np.nonzero(di > thr)[0] + 1
+        if not len(j):
+            continue
+        rj = np.abs(vv[j] - vv[j - 1]) / di[j - 1]
+        rj = rj[np.isfinite(rj) & (rj > 0)]
+        if len(rj):
+            out[k] = float(np.median(rj))
+    return out
+
+
 # --- идентификация -----------------------------------------------------------
 
 @dataclass
@@ -496,6 +521,13 @@ def identify_cell(
          for cid in sub_ids],
         dtype=torch.float64)
 
+    # измеренное сопротивление цикла: медиана |ΔV/ΔI| на фронтах тока —
+    # прямой канал наблюдения r_total, независимый от формы кривой V(t)
+    r_meas_np = cycle_r_meas(df, sub_ids)
+    r_meas_t = torch.tensor(np.nan_to_num(r_meas_np, nan=0.0),
+                            dtype=torch.float64)
+    r_meas_ok = torch.tensor(np.isfinite(r_meas_np))
+
     # аффинные пары кривых: инициализация из якорей/фазы 0
     sp0_init = pseudo_fit["sp"] if pseudo_fit else 1.0
     bp0_init = pseudo_fit["bp"] if pseudo_fit else 0.0
@@ -543,9 +575,29 @@ def identify_cell(
             over = torch.clamp(
                 (q_pred[0] - q_pred) - (ce_def + 0.05 * q_li0), min=0.0)
             l_ce = torch.mean((over / q_li0) ** 2)
+            # необратимость: инвентарь не растёт (допуск 0.5% на шум)
+            l_mono = (torch.clamp(
+                q_pred.diff() - 0.005 * q_li0, min=0.0) ** 2).mean()
         else:
-            l_cap = l_ce = torch.zeros((), dtype=torch.float64)
-        return l_volt + 0.5 * l_cap + 5.0 * l_ce, out
+            l_cap = l_ce = l_mono = torch.zeros((), dtype=torch.float64)
+        # якорь сопротивления: замер фронтов включает раннюю кинетику,
+        # поэтому пол — 0.3×замера; штраф только за сильное занижение
+        l_r = torch.zeros((), dtype=torch.float64)
+        if bool(r_meas_ok.any()):
+            rt_v = rt.exp()
+            viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
+                               - torch.log(rt_v[r_meas_ok]), min=0.0)
+            l_r = viol.pow(2).mean()
+        # λ нерастущи после формовки: LAM необратим (допуск 0.02/окно
+        # на смачивание и оседание контактов ранних циклов)
+        if ln is not None:
+            l_mono = l_mono + (torch.clamp(
+                lam_of(ln).diff() - 0.02, min=0.0) ** 2).mean()
+        if lp is not None:
+            l_mono = l_mono + (torch.clamp(
+                lam_of(lp).diff() - 0.02, min=0.0) ** 2).mean()
+        return l_volt + 0.5 * l_cap + 5.0 * l_ce + 3.0 * l_r \
+            + 2.0 * l_mono, out
 
     # --- выбор кода катода ---
     if pseudo_fit:
@@ -706,6 +758,10 @@ def refine_per_cycle(
     """
     t, i, v, mask = pack_cycles(df, res.cycles)
     B, N = i.shape
+    r_meas_np = cycle_r_meas(df, res.cycles)
+    r_meas_t = torch.tensor(np.nan_to_num(r_meas_np, nan=0.0),
+                            dtype=torch.float64)
+    r_meas_ok = torch.tensor(np.isfinite(r_meas_np))
 
     def theta_of(raw):
         return -0.2 + 1.4 * raw.sigmoid()
@@ -776,7 +832,18 @@ def refine_per_cycle(
         # непрерывность траекторий в логит-/лог-координатах
         l_cont = sum(((p[1:] - p[:-1]) ** 2).mean()
                      for p in (tn0, tp0, rt, ln, lp))
-        loss = l_volt + 0.5 * l_cap + w_cont * l_cont
+        # якорь R по замеренным фронтам тока (как в identify)
+        l_r = torch.zeros((), dtype=torch.float64)
+        if bool(r_meas_ok.any()):
+            rt_v = rt.exp()
+            viol = torch.clamp(torch.log(0.3 * r_meas_t[r_meas_ok])
+                               - torch.log(rt_v[r_meas_ok]), min=0.0)
+            l_r = viol.pow(2).mean()
+        # λ нерастущи после формовки (допуск 0.02/окно)
+        l_mono = (torch.clamp(lam_of(ln).diff() - 0.02, min=0.0) ** 2).mean() \
+            + (torch.clamp(lam_of(lp).diff() - 0.02, min=0.0) ** 2).mean()
+        loss = l_volt + 0.5 * l_cap + w_cont * l_cont + 3.0 * l_r \
+            + 2.0 * l_mono
         loss.backward()
         opt.step()
         sched.step()
