@@ -76,7 +76,7 @@ def main() -> None:
         print(f"{name:10} {np.median(d):10.3g} {np.percentile(d,90):10.3g} "
               f"{d.max():10.3g} {unit}")
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+    fig, axes = plt.subplots(2, 4, figsize=(19, 7))
     for ax, (k, name, unit) in zip(axes.ravel(), CHANNELS):
         d = np.asarray(diffs[k])
         ax.hist(d[np.isfinite(d)], bins=40, color="tab:blue", alpha=0.75)
@@ -84,6 +84,17 @@ def main() -> None:
                      + (f" [{unit}]" if unit else ""))
         ax.set_yscale("log")
         ax.grid(True, which="both", lw=0.4, alpha=0.6)
+    # диагональная диаграмма невязок V: старый vs выровненный код
+    ax = axes.ravel()[6]
+    ro, rn = np.asarray(rmse_old), np.asarray(rmse_new)
+    lim = max(ro.max(), rn.max()) * 1.05
+    ax.plot([0, lim], [0, lim], "k--", lw=1)
+    ax.scatter(ro, rn, s=14, alpha=0.6, color="tab:red")
+    ax.set_xlabel("V RMSE старый, мВ")
+    ax.set_ylabel("V RMSE выровненный, мВ")
+    ax.set_title("невязка напряжения по элементам")
+    ax.grid(True, which="both", lw=0.4, alpha=0.6)
+    axes.ravel()[7].axis("off")
     fig.suptitle("расхождение идентификаций: старый код vs выровненный")
     fig.tight_layout()
     out = ROOT / "checkpoints" / "compare_stage1.png"
